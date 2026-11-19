@@ -49,6 +49,8 @@ func ForKind(kind schema.GroupVersionKind) interface{} {
 		return &apiv1alpha1.ProcessorApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("Protocol"):
 		return &apiv1alpha1.ProtocolApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("SecureBootStatus"):
+		return &apiv1alpha1.SecureBootStatusApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("Server"):
 		return &apiv1alpha1.ServerApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("ServerBootConfiguration"):

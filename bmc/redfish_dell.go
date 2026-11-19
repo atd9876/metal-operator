@@ -16,6 +16,7 @@ import (
 	"strings"
 
 	"github.com/stmcginnis/gofish/schemas"
+	ctrl "sigs.k8s.io/controller-runtime"
 )
 
 // DellRedfishBMC is the Dell-specific implementation of the BMC interface.
@@ -1032,4 +1033,93 @@ func (r *DellRedfishBMC) CreateEventSubscription(
 		payload.EventTypes = []schemas.EventType{schemas.MetricReportEventType}
 	}
 	return r.postEventSubscription(ev.SubscriptionsLink, ev.GetClient(), payload, destination, defaultIsDuplicate)
+}
+
+// dellSecureBootPolicyAttribute is the Dell iDRAC BIOS attribute that gates
+// custom Secure Boot key enrollment. Values are "Standard" and "Custom".
+const dellSecureBootPolicyAttribute = "SecureBootPolicy"
+
+// dellSecureBootAttribute is the Dell iDRAC BIOS attribute that enables or
+// disables Secure Boot. Values are "Enabled" and "Disabled". The standard
+// Redfish SecureBoot resource's SecureBootEnable property is read-only on Dell
+// (SYS427), so enable/disable must go through this BIOS attribute instead.
+const dellSecureBootAttribute = "SecureBoot"
+
+// readBiosAttribute reads a single BIOS attribute from the Bios resource's
+// Attributes map directly. Unlike GetBiosAttributeValues it does not enumerate
+// the attribute registries, which can 404 on iDRACs that reference missing NIC
+// registries and would otherwise fail the whole read.
+func (r *DellRedfishBMC) readBiosAttribute(ctx context.Context, systemURI, name string) (string, bool, error) {
+	system, err := r.getSystemFromUri(ctx, systemURI)
+	if err != nil {
+		return "", false, err
+	}
+	bios, err := system.Bios()
+	if err != nil {
+		return "", false, err
+	}
+	v, ok := bios.Attributes[name]
+	if !ok {
+		return "", false, nil
+	}
+	s, ok := v.(string)
+	return s, ok, nil
+}
+
+// GetSecureBootState augments the base Secure Boot state with the Dell
+// SecureBootPolicy BIOS attribute, which the standard Redfish SecureBoot
+// resource does not expose. A failure to read the policy is non-fatal: the
+// base Enabled/Mode/CurrentBoot fields are what the controller gates on, so a
+// missing policy only leaves Policy empty.
+func (r *DellRedfishBMC) GetSecureBootState(ctx context.Context, systemURI string) (*SecureBootState, error) {
+	state, err := r.RedfishBaseBMC.GetSecureBootState(ctx, systemURI)
+	if err != nil {
+		return nil, err
+	}
+	policy, ok, err := r.readBiosAttribute(ctx, systemURI, dellSecureBootPolicyAttribute)
+	if err != nil {
+		log := ctrl.LoggerFrom(ctx)
+		log.V(1).Info("Could not read SecureBootPolicy BIOS attribute; leaving Policy empty", "error", err)
+		return state, nil
+	}
+	if ok {
+		state.Policy = SecureBootPolicy(policy)
+	}
+	return state, nil
+}
+
+// SetSecureBootEnabled stages the Dell BIOS attribute SecureBoot=Enabled/Disabled.
+// The base implementation PATCHes the Redfish SecureBoot resource's
+// SecureBootEnable property, which is read-only on Dell (SYS427); the BIOS
+// attribute is the writable path. The change applies on the next reboot.
+func (r *DellRedfishBMC) SetSecureBootEnabled(ctx context.Context, systemURI string, enable bool) error {
+	value := "Disabled"
+	if enable {
+		value = "Enabled"
+	}
+	attrs := schemas.SettingsAttributes{dellSecureBootAttribute: value}
+	if err := r.SetBiosAttributesOnReset(ctx, systemURI, attrs); err != nil {
+		return fmt.Errorf("stage %s=%s: %w", dellSecureBootAttribute, value, err)
+	}
+	return nil
+}
+
+// EnsureCustomKeyPolicy stages SecureBootPolicy=Custom when the server is in the
+// factory Standard policy, under which the custom key databases are read-only.
+// The change is applied on the next reboot, so it rides the ClearingKeys reboot.
+func (r *DellRedfishBMC) EnsureCustomKeyPolicy(ctx context.Context, systemURI string) error {
+	state, err := r.GetSecureBootState(ctx, systemURI)
+	if err != nil {
+		return err
+	}
+	if state.Policy == SecureBootPolicyCustom {
+		return nil
+	}
+	attrs := schemas.SettingsAttributes{
+		dellSecureBootPolicyAttribute: string(SecureBootPolicyCustom),
+	}
+	if err := r.SetBiosAttributesOnReset(ctx, systemURI, attrs); err != nil {
+		return fmt.Errorf("stage %s=Custom: %w", dellSecureBootPolicyAttribute, err)
+	}
+	return nil
 }

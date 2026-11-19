@@ -287,6 +287,7 @@ type MockServer struct {
 	actionHandlers       []actionHandler       // ordered POST action dispatch table (first match wins)
 	onCreate             map[string]memberHook // collection URL suffix → hook called after a member is added
 	onDelete             map[string]memberHook // collection URL suffix → hook called before a member is removed
+	systemGen            map[string]int64      // per-system generation counter; incremented by ResetSystemState to cancel in-flight power goroutines
 }
 
 // loadAccountsFromEmbedded seeds the authentication store by reading the
@@ -329,6 +330,7 @@ func NewMockServer(log logr.Logger, addr string, opts ...Option) *MockServer {
 		overrides:         make(map[string]any),
 		etags:             make(map[string]string),
 		upgradedResources: make(map[string]string),
+		systemGen:         make(map[string]int64),
 		accounts:          loadAccountsFromEmbedded(),
 		// onCreate hooks run after a new collection member is stored.
 		// Add an entry here to handle side-effects for additional collection types.
@@ -416,6 +418,10 @@ func NewMockServer(log logr.Logger, addr string, opts ...Option) *MockServer {
 		{
 			matches: hasSuffix("/Actions/ManagerAccount.ChangePassword"),
 			handle:  s.handleChangePassword,
+		},
+		{
+			matches: hasSuffix("/Actions/SecureBoot.ResetKeys"),
+			handle:  s.handleSecureBootResetKeys,
 		},
 	}
 
@@ -1235,15 +1241,16 @@ func (s *MockServer) handleSystemReset(w http.ResponseWriter, r *http.Request, b
 
 	s.setLocked(base, true)
 	s.overrides[systemPath] = base
+	gen := s.systemGen[systemPath]
 	s.mu.Unlock()
 
 	switch resetType {
 	case "off":
-		go s.doPowerOff(systemPath)
+		go s.doPowerOff(systemPath, gen)
 	case "on":
-		go s.doPowerOn(systemPath, basePath)
+		go s.doPowerOn(systemPath, basePath, gen)
 	case "reset":
-		go s.doPowerReset(systemPath, basePath)
+		go s.doPowerReset(systemPath, basePath, gen)
 	}
 
 	s.writeJSON(w, http.StatusAccepted, map[string]string{"status": "Accepted"})
@@ -1281,6 +1288,99 @@ func (s *MockServer) handleChangePassword(w http.ResponseWriter, r *http.Request
 	account["Password"] = req.NewPassword
 	s.overrides[filePath] = account
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// secureBootWritableDatabases lists the writable database IDs whose Certificates
+// and Signatures collections are cleared on a DeleteAllKeys or DeletePK reset.
+var secureBootWritableDatabases = []string{"PK", "KEK", "db", "dbx"}
+
+func (s *MockServer) handleSecureBootResetKeys(w http.ResponseWriter, r *http.Request, body []byte) {
+	var req struct {
+		ResetKeysType string `json:"ResetKeysType"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil || req.ResetKeysType == "" {
+		http.Error(w, "invalid body: ResetKeysType required", http.StatusBadRequest)
+		return
+	}
+
+	// Derive the SecureBoot resource path from the action URL, e.g.
+	// /redfish/v1/Systems/437XR1138R2/SecureBoot/Actions/SecureBoot.ResetKeys
+	// → /redfish/v1/Systems/437XR1138R2/SecureBoot
+	sbBasePath := strings.TrimSuffix(r.URL.Path, "/Actions/SecureBoot.ResetKeys")
+	sbFilePath := resolvePath(sbBasePath)
+	dbsBasePath := sbBasePath + "/SecureBootDatabases"
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	sb, err := s.loadResourceLocked(sbFilePath)
+	if err != nil {
+		s.handleError(w, r, err)
+		return
+	}
+
+	switch req.ResetKeysType {
+	case "DeletePK":
+		s.clearSecureBootDBCollectionsLocked(dbsBasePath, []string{"PK"})
+		sb["SecureBootMode"] = "SetupMode"
+		sb["SecureBootEnable"] = false
+	case "DeleteAllKeys":
+		s.clearSecureBootDBCollectionsLocked(dbsBasePath, secureBootWritableDatabases)
+		sb["SecureBootMode"] = "SetupMode"
+		sb["SecureBootEnable"] = false
+	case "ResetAllKeysToDefault":
+		s.restoreSecureBootDBCollectionsLocked(dbsBasePath, secureBootWritableDatabases)
+		sb["SecureBootMode"] = "UserMode"
+	default:
+		http.Error(w, "unsupported ResetKeysType: "+req.ResetKeysType, http.StatusBadRequest)
+		return
+	}
+
+	s.overrides[sbFilePath] = sb
+	s.writeJSON(w, http.StatusAccepted, map[string]string{"status": "Accepted"})
+}
+
+// clearSecureBootDBCollectionsLocked empties the Certificates and Signatures
+// collections for the given database IDs by storing empty-member overrides.
+// Must be called with s.mu held.
+func (s *MockServer) clearSecureBootDBCollectionsLocked(dbsBasePath string, dbIDs []string) {
+	for _, id := range dbIDs {
+		for _, sub := range []string{"Certificates", "Signatures"} {
+			collPath := resolvePath(dbsBasePath + "/" + id + "/" + sub)
+			// Only clear collections that exist in the embedded fixtures.
+			if _, err := dataFS.ReadFile(collPath); err == nil {
+				s.overrides[collPath] = Collection{Members: []Member{}}
+			}
+			// Remove any dynamically-added member overrides under this collection.
+			prefix := strings.TrimSuffix(collPath, "index.json")
+			for key := range s.overrides {
+				if strings.HasPrefix(key, prefix) && key != collPath {
+					delete(s.overrides, key)
+				}
+			}
+		}
+	}
+}
+
+// restoreSecureBootDBCollectionsLocked restores the Certificates and Signatures
+// collections to their embedded fixture data for the given database IDs.
+// Must be called with s.mu held.
+func (s *MockServer) restoreSecureBootDBCollectionsLocked(dbsBasePath string, dbIDs []string) {
+	for _, id := range dbIDs {
+		for _, sub := range []string{"Certificates", "Signatures"} {
+			collPath := resolvePath(dbsBasePath + "/" + id + "/" + sub)
+			if _, err := dataFS.ReadFile(collPath); err == nil {
+				s.resetResourceFromEmbeddedLocked(collPath)
+			}
+			// Remove dynamically-added member overrides so embedded members are served.
+			prefix := strings.TrimSuffix(collPath, "index.json")
+			for key := range s.overrides {
+				if strings.HasPrefix(key, prefix) && key != collPath {
+					delete(s.overrides, key)
+				}
+			}
+		}
+	}
 }
 
 func (s *MockServer) handleBMCReset(w http.ResponseWriter, r *http.Request, body []byte) {
@@ -1329,11 +1429,14 @@ func (s *MockServer) parseResetType(body []byte, offStates, onStates, resetState
 	}
 }
 
-func (s *MockServer) doPowerOff(systemPath string) {
+func (s *MockServer) doPowerOff(systemPath string, gen int64) {
 	time.Sleep(50 * time.Millisecond)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.systemGen[systemPath] != gen {
+		return // superseded by ResetSystemState; discard
+	}
 	if base, ok := s.overrides[systemPath].(map[string]any); ok {
 		base["PowerState"] = PowerOffState
 		s.setLocked(base, false)
@@ -1341,15 +1444,17 @@ func (s *MockServer) doPowerOff(systemPath string) {
 	}
 }
 
-func (s *MockServer) doPowerOn(systemPath, basePath string) {
+func (s *MockServer) doPowerOn(systemPath, basePath string, gen int64) {
 	time.Sleep(50 * time.Millisecond)
 	s.activateLenovoPendingFirmware()
 
 	s.mu.Lock()
-	if base, ok := s.overrides[systemPath].(map[string]any); ok {
-		base["PowerState"] = PowerOnState
-		s.setLocked(base, false)
-		s.log.Info("Powered on the system")
+	if s.systemGen[systemPath] == gen {
+		if base, ok := s.overrides[systemPath].(map[string]any); ok {
+			base["PowerState"] = PowerOnState
+			s.setLocked(base, false)
+			s.log.Info("Powered on the system")
+		}
 	}
 	s.mu.Unlock()
 
@@ -1358,12 +1463,14 @@ func (s *MockServer) doPowerOn(systemPath, basePath string) {
 	}
 }
 
-func (s *MockServer) doPowerReset(systemPath, basePath string) {
+func (s *MockServer) doPowerReset(systemPath, basePath string, gen int64) {
 	time.Sleep(50 * time.Millisecond)
 	s.mu.Lock()
-	if base, ok := s.overrides[systemPath].(map[string]any); ok {
-		base["PowerState"] = PowerOffState
-		s.log.Info("Powered off the system")
+	if s.systemGen[systemPath] == gen {
+		if base, ok := s.overrides[systemPath].(map[string]any); ok {
+			base["PowerState"] = PowerOffState
+			s.log.Info("Powered off the system")
+		}
 	}
 	s.mu.Unlock()
 
@@ -1372,10 +1479,12 @@ func (s *MockServer) doPowerReset(systemPath, basePath string) {
 	s.activateLenovoPendingFirmware()
 
 	s.mu.Lock()
-	if base, ok := s.overrides[systemPath].(map[string]any); ok {
-		base["PowerState"] = PowerOnState
-		s.setLocked(base, false)
-		s.log.Info("Powered on the system")
+	if s.systemGen[systemPath] == gen {
+		if base, ok := s.overrides[systemPath].(map[string]any); ok {
+			base["PowerState"] = PowerOnState
+			s.setLocked(base, false)
+			s.log.Info("Powered on the system")
+		}
 	}
 	s.mu.Unlock()
 
@@ -1888,6 +1997,109 @@ func (s *MockServer) ResetAccounts() {
 		}
 	}
 	s.accounts = loadAccountsFromEmbedded()
+}
+
+// SecureBootStateInfo holds the current Secure Boot flags as tracked by the mock.
+type SecureBootStateInfo struct {
+	Enabled bool
+	Mode    string
+}
+
+// GetSecureBootState returns the current SecureBootEnable flag and SecureBootMode
+// for the given system path (e.g. "/redfish/v1/Systems/437XR1138R2"). Returns
+// zero value if the resource cannot be loaded.
+func (s *MockServer) GetSecureBootState(systemPath string) SecureBootStateInfo {
+	sbPath := resolvePath(systemPath + "/SecureBoot")
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	res, err := s.loadResourceLocked(sbPath)
+	if err != nil {
+		return SecureBootStateInfo{}
+	}
+	enabled, _ := res["SecureBootEnable"].(bool)
+	mode, _ := res["SecureBootMode"].(string)
+	return SecureBootStateInfo{Enabled: enabled, Mode: mode}
+}
+
+// ResetSecureBootState restores the SecureBoot resource and all writable database
+// collections to their embedded fixture defaults. Call this in AfterEach to
+// ensure a clean slate between Secure Boot tests.
+func (s *MockServer) ResetSecureBootState(systemPath string) {
+	sbPath := resolvePath(systemPath + "/SecureBoot")
+	dbsBasePath := systemPath + "/SecureBoot/SecureBootDatabases"
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.resetResourceFromEmbeddedLocked(sbPath)
+	s.restoreSecureBootDBCollectionsLocked(dbsBasePath, secureBootWritableDatabases)
+}
+
+// ResetSystemState restores the system resource to the embedded fixture (PowerState=On,
+// no lock) and increments the generation counter so any in-flight power goroutines
+// from a previous test become no-ops.
+// Call this in BeforeEach/AfterEach to ensure a clean slate between tests.
+func (s *MockServer) ResetSystemState(systemPath string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.systemGen[resolvePath(systemPath)]++
+	// Restore from embedded fixture so the lock field is explicitly cleared.
+	// Deleting the override would also re-read the fixture on demand, but an
+	// in-flight goroutine that was waiting to unlock might never run (its
+	// generation no longer matches), leaving the system perpetually locked.
+	s.resetResourceFromEmbeddedLocked(resolvePath(systemPath))
+}
+
+// SetSecureBootMode directly sets SecureBootMode and SecureBootEnable on the
+// SecureBoot resource for the given system. Use in tests to simulate the
+// mode transitions a real BMC applies after a reboot.
+// mode should be one of "SetupMode", "UserMode", "AuditMode", "DeployedMode".
+func (s *MockServer) SetSecureBootMode(systemPath, mode string) {
+	sbPath := resolvePath(systemPath + "/SecureBoot")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	res, err := s.loadResourceLocked(sbPath)
+	if err != nil {
+		s.log.Error(err, "SetSecureBootMode: could not load SecureBoot resource", "path", sbPath)
+		return
+	}
+	res["SecureBootMode"] = mode
+	s.overrides[sbPath] = res
+}
+
+// SetSecureBootEnable directly sets the SecureBootEnable flag on the SecureBoot
+// resource for the given system. Use in tests to simulate a server that already
+// has Secure Boot enabled before the controller acts.
+func (s *MockServer) SetSecureBootEnable(systemPath string, enable bool) {
+	sbPath := resolvePath(systemPath + "/SecureBoot")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	res, err := s.loadResourceLocked(sbPath)
+	if err != nil {
+		s.log.Error(err, "SetSecureBootEnable: could not load SecureBoot resource", "path", sbPath)
+		return
+	}
+	res["SecureBootEnable"] = enable
+	s.overrides[sbPath] = res
+}
+
+// SetSecureBootCurrentBoot sets the SecureBootCurrentBoot field to simulate
+// whether Secure Boot was active on the most recent boot. Pass true to set
+// "Enabled", false to set "Disabled". Use in tests to simulate the
+// EnabledOnBoot state a real BMC reports after rebooting with SB active.
+func (s *MockServer) SetSecureBootCurrentBoot(systemPath string, active bool) {
+	sbPath := resolvePath(systemPath + "/SecureBoot")
+	val := "Disabled"
+	if active {
+		val = "Enabled"
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	res, err := s.loadResourceLocked(sbPath)
+	if err != nil {
+		s.log.Error(err, "SetSecureBootCurrentBoot: could not load SecureBoot resource", "path", sbPath)
+		return
+	}
+	res["SecureBootCurrentBoot"] = val
+	s.overrides[sbPath] = res
 }
 
 // SetResourceETag sets the ETag for the resource at urlPath.

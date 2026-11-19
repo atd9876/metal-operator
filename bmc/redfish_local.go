@@ -274,7 +274,17 @@ func (r *RedfishLocalBMC) CheckBMCPendingComponentUpgrade(_ context.Context, _ C
 	return false, nil
 }
 
-// SetBootOverride sets the boot device for the next system boot using Redfish.
+// SetBootOverride sets a one-time PXE boot override using Redfish.
 func (r *RedfishLocalBMC) SetBootOverride(ctx context.Context, systemURI string) error {
 	return r.RedfishBaseBMC.SetBootOverride(ctx, systemURI)
+}
+
+// SetBootOverrideContinuous sets a persistent PXE boot override using Redfish.
+func (r *RedfishLocalBMC) SetBootOverrideContinuous(ctx context.Context, systemURI string) error {
+	return r.RedfishBaseBMC.SetBootOverrideContinuous(ctx, systemURI)
+}
+
+// DisableBootOverride clears the active boot source override.
+func (r *RedfishLocalBMC) DisableBootOverride(ctx context.Context, systemURI string) error {
+	return r.RedfishBaseBMC.DisableBootOverride(ctx, systemURI)
 }

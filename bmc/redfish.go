@@ -291,7 +291,53 @@ func (r *RedfishBaseBMC) SetBootOverride(ctx context.Context, systemURI string) 
 	log := ctrl.LoggerFrom(ctx)
 	log.V(2).Info("Setting PXE boot once", "SystemURI", systemURI, "Boot settings", setBoot)
 	if err := system.SetBoot(&setBoot); err != nil {
-		return fmt.Errorf("failed to set the boot order: %w", err)
+		return fmt.Errorf("failed to set boot override: %w", err)
+	}
+	return nil
+}
+
+// SetBootOverrideContinuous sets a persistent PXE boot override using Redfish
+// (BootSourceOverrideEnabled=Continuous). The override applies on every boot
+// until DisableBootOverride is called. Only sets BootSourceOverrideMode when
+// the BMC reports a current mode; older BMCs that don't expose the field reject
+// it if included.
+func (r *RedfishBaseBMC) SetBootOverrideContinuous(ctx context.Context, systemURI string) error {
+	system, err := r.getSystemFromUri(ctx, systemURI)
+	if err != nil {
+		return fmt.Errorf("failed to get systems: %w", err)
+	}
+
+	setBoot := schemas.Boot{
+		BootSourceOverrideEnabled: schemas.ContinuousBootSourceOverrideEnabled,
+		BootSourceOverrideTarget:  schemas.PxeBootSource,
+	}
+	if system.Boot.BootSourceOverrideMode != "" && system.Boot.BootSourceOverrideMode != schemas.UEFIBootSourceOverrideMode {
+		setBoot.BootSourceOverrideMode = schemas.UEFIBootSourceOverrideMode
+	}
+
+	log := ctrl.LoggerFrom(ctx)
+	log.V(2).Info("Setting PXE boot continuous", "SystemURI", systemURI, "Boot settings", setBoot)
+	if err := system.SetBoot(&setBoot); err != nil {
+		return fmt.Errorf("failed to set continuous boot override: %w", err)
+	}
+	return nil
+}
+
+// DisableBootOverride clears the active boot source override, restoring the
+// normal BIOS boot order.
+func (r *RedfishBaseBMC) DisableBootOverride(ctx context.Context, systemURI string) error {
+	system, err := r.getSystemFromUri(ctx, systemURI)
+	if err != nil {
+		return fmt.Errorf("failed to get systems: %w", err)
+	}
+	setBoot := schemas.Boot{
+		BootSourceOverrideEnabled: schemas.DisabledBootSourceOverrideEnabled,
+		BootSourceOverrideTarget:  schemas.NoneBootSource,
+	}
+	log := ctrl.LoggerFrom(ctx)
+	log.V(2).Info("Disabling boot override", "SystemURI", systemURI)
+	if err := system.SetBoot(&setBoot); err != nil {
+		return fmt.Errorf("failed to disable boot override: %w", err)
 	}
 	return nil
 }
@@ -1377,5 +1423,118 @@ func (r *RedfishBaseBMC) DeleteEventSubscription(_ context.Context, uri string) 
 	if err := ev.DeleteEventSubscription(uri); err != nil {
 		return fmt.Errorf("failed to delete event subscription: %w", err)
 	}
+	return nil
+}
+
+func (r *RedfishBaseBMC) GetSecureBootState(ctx context.Context, systemURI string) (*SecureBootState, error) {
+	system, err := r.getSystemFromUri(ctx, systemURI)
+	if err != nil {
+		return nil, fmt.Errorf("get system %s: %w", systemURI, err)
+	}
+	sb, err := system.SecureBoot()
+	if err != nil {
+		return nil, fmt.Errorf("get SecureBoot resource: %w", err)
+	}
+	return &SecureBootState{
+		Enabled:       sb.SecureBootEnable,
+		EnabledOnBoot: sb.SecureBootCurrentBoot == schemas.EnabledSecureBootCurrentBootType,
+		Mode:          SecureBootMode(sb.SecureBootMode),
+	}, nil
+}
+
+func (r *RedfishBaseBMC) ResetSecureBootKeys(ctx context.Context, systemURI string, resetType SecureBootResetType) error {
+	system, err := r.getSystemFromUri(ctx, systemURI)
+	if err != nil {
+		return fmt.Errorf("get system %s: %w", systemURI, err)
+	}
+	sb, err := system.SecureBoot()
+	if err != nil {
+		return fmt.Errorf("get SecureBoot resource: %w", err)
+	}
+	if _, err := sb.ResetKeys(schemas.ResetKeysType(resetType)); err != nil {
+		return fmt.Errorf("ResetKeys %s: %w", resetType, err)
+	}
+	return nil
+}
+
+func (r *RedfishBaseBMC) EnrollCertificate(ctx context.Context, systemURI string, database string, pemCert string) error {
+	system, err := r.getSystemFromUri(ctx, systemURI)
+	if err != nil {
+		return fmt.Errorf("get system %s: %w", systemURI, err)
+	}
+	sb, err := system.SecureBoot()
+	if err != nil {
+		return fmt.Errorf("get SecureBoot resource: %w", err)
+	}
+	dbs, err := sb.SecureBootDatabases()
+	if err != nil {
+		return fmt.Errorf("get SecureBootDatabases: %w", err)
+	}
+	var target *schemas.SecureBootDatabase
+	for _, db := range dbs {
+		if db.DatabaseID == database {
+			target = db
+			break
+		}
+	}
+	if target == nil {
+		return fmt.Errorf("SecureBootDatabase %q not found: %w", database, ErrNotSupported)
+	}
+	if _, err := target.AddCertificate(pemCert, schemas.PEMCertificateType, ""); err != nil {
+		return fmt.Errorf("enroll cert to %s: %w", database, err)
+	}
+	return nil
+}
+
+func (r *RedfishBaseBMC) EnrollHash(ctx context.Context, systemURI string, database string, hash string) error {
+	system, err := r.getSystemFromUri(ctx, systemURI)
+	if err != nil {
+		return fmt.Errorf("get system %s: %w", systemURI, err)
+	}
+	sb, err := system.SecureBoot()
+	if err != nil {
+		return fmt.Errorf("get SecureBoot resource: %w", err)
+	}
+	dbs, err := sb.SecureBootDatabases()
+	if err != nil {
+		return fmt.Errorf("get SecureBootDatabases: %w", err)
+	}
+	var target *schemas.SecureBootDatabase
+	for _, db := range dbs {
+		if db.DatabaseID == database {
+			target = db
+			break
+		}
+	}
+	if target == nil {
+		return fmt.Errorf("SecureBootDatabase %q not found: %w", database, ErrNotSupported)
+	}
+	if _, err := target.AddSignature(hash, schemas.UEFISignatureTypeRegistry, "EFI_CERT_SHA256_GUID", ""); err != nil {
+		return fmt.Errorf("enroll hash to %s: %w", database, err)
+	}
+	return nil
+}
+
+func (r *RedfishBaseBMC) SetSecureBootEnabled(ctx context.Context, systemURI string, enable bool) error {
+	system, err := r.getSystemFromUri(ctx, systemURI)
+	if err != nil {
+		return fmt.Errorf("get system %s: %w", systemURI, err)
+	}
+	sb, err := system.SecureBoot()
+	if err != nil {
+		return fmt.Errorf("get SecureBoot resource: %w", err)
+	}
+	sb.SecureBootEnable = enable
+	if err := sb.Update(); err != nil {
+		return fmt.Errorf("PATCH SecureBootEnable=%v: %w", enable, err)
+	}
+	return nil
+}
+
+// EnsureCustomKeyPolicy is a no-op on the base implementation: standard Redfish
+// has no Secure Boot key-policy concept, so custom key enrollment is assumed to
+// be permitted. Vendors that gate enrollment behind a policy attribute (Dell)
+// override this.
+func (r *RedfishBaseBMC) EnsureCustomKeyPolicy(ctx context.Context, systemURI string) error {
 	return nil
 }

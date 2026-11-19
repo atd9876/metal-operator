@@ -40,6 +40,9 @@ type ServerStatusApplyConfiguration struct {
 	Storages []StorageApplyConfiguration `json:"storages,omitempty"`
 	// Conditions represents the latest available observations of the server's current state.
 	Conditions []v1.ConditionApplyConfiguration `json:"conditions,omitempty"`
+	// SecureBoot holds the current UEFI Secure Boot state as reported by the BMC.
+	// Absent if the BMC does not expose the Redfish SecureBoot resource.
+	SecureBoot *SecureBootStatusApplyConfiguration `json:"secureBoot,omitempty"`
 }
 
 // ServerStatusApplyConfiguration constructs a declarative configuration of the ServerStatus type for use with
@@ -156,5 +159,13 @@ func (b *ServerStatusApplyConfiguration) WithConditions(values ...*v1.ConditionA
 		}
 		b.Conditions = append(b.Conditions, *values[i])
 	}
+	return b
+}
+
+// WithSecureBoot sets the SecureBoot field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the SecureBoot field is set to the value of the last call.
+func (b *ServerStatusApplyConfiguration) WithSecureBoot(value *SecureBootStatusApplyConfiguration) *ServerStatusApplyConfiguration {
+	b.SecureBoot = value
 	return b
 }

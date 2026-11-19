@@ -164,6 +164,12 @@ const (
 	// external component can run out-of-band day-2 operations. Parked is an overlay state: while
 	// active, normal state-machine progression, boot, and power healing are suspended.
 	ServerStateParked ServerState = "Parked"
+
+	// ServerStateInitial is the state before the server has been fully discovered.
+	ServerStateInitial ServerState = "Initial"
+
+	// ServerStateDiscovery indicates the server is being probed / identified.
+	ServerStateDiscovery ServerState = "Discovery"
 )
 
 // IndicatorLED represents LED indicator states
@@ -243,6 +249,17 @@ type ServerStatus struct {
 	// +patchMergeKey=type
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type" protobuf:"bytes,1,rep,name=conditions"`
+
+	// SecureBoot holds the current UEFI Secure Boot state as reported by the BMC.
+	// Absent if the BMC does not expose the Redfish SecureBoot resource.
+	// +optional
+	SecureBoot *SecureBootStatus `json:"secureBoot,omitempty"`
+}
+
+// SecureBootStatus holds the Secure Boot state reported by the BMC.
+type SecureBootStatus struct {
+	// Enabled reflects the persisted SecureBootEnable flag on the BMC.
+	Enabled bool `json:"enabled"`
 }
 
 // Processor defines the details of a Processor.

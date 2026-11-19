@@ -455,3 +455,24 @@ func lenovoIsStagedRepositoryFirmware(fw *schemas.SoftwareInventory) bool {
 	}
 	return fw.Status.State != schemas.DisabledState && strings.TrimSpace(fw.Version) != ""
 }
+
+// EnrollCertificate is not supported on Lenovo XCC. Secure Boot key
+// enrollment is only possible via the F1 firmware setup menu.
+func (l *LenovoRedfishBMC) EnrollCertificate(_ context.Context, _ string, _ string, _ string) error {
+	return ErrNotSupported
+}
+
+// EnrollHash is not supported on Lenovo XCC via Redfish.
+func (l *LenovoRedfishBMC) EnrollHash(_ context.Context, _ string, _ string, _ string) error {
+	return ErrNotSupported
+}
+
+// ResetSecureBootKeys is not supported on Lenovo XCC via Redfish.
+func (l *LenovoRedfishBMC) ResetSecureBootKeys(_ context.Context, _ string, _ SecureBootResetType) error {
+	return ErrNotSupported
+}
+
+// SetSecureBootEnabled is not supported on Lenovo XCC via Redfish.
+func (l *LenovoRedfishBMC) SetSecureBootEnabled(_ context.Context, _ string, _ bool) error {
+	return ErrNotSupported
+}

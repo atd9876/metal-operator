@@ -376,6 +376,18 @@ spec:
                   - id
                   type: object
                 type: array
+              secureBoot:
+                description: |-
+                  SecureBoot holds the current UEFI Secure Boot state as reported by the BMC.
+                  Absent if the BMC does not expose the Redfish SecureBoot resource.
+                properties:
+                  enabled:
+                    description: Enabled reflects the persisted SecureBootEnable flag
+                      on the BMC.
+                    type: boolean
+                required:
+                - enabled
+                type: object
               serialNumber:
                 description: SerialNumber is the serial number of the server.
                 type: string

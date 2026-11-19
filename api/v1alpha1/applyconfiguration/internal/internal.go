@@ -304,6 +304,12 @@ var schemaYAML = typed.YAMLObject(`types:
   scalar: string
 - name: com.github.ironcore-dev.metal-operator.api.v1alpha1.ProtocolScheme
   scalar: string
+- name: com.github.ironcore-dev.metal-operator.api.v1alpha1.SecureBootStatus
+  map:
+    fields:
+    - name: enabled
+      type:
+        scalar: boolean
 - name: com.github.ironcore-dev.metal-operator.api.v1alpha1.Server
   map:
     fields:
@@ -546,6 +552,9 @@ var schemaYAML = typed.YAMLObject(`types:
           elementType:
             namedType: com.github.ironcore-dev.metal-operator.api.v1alpha1.Processor
           elementRelationship: atomic
+    - name: secureBoot
+      type:
+        namedType: com.github.ironcore-dev.metal-operator.api.v1alpha1.SecureBootStatus
     - name: serialNumber
       type:
         scalar: string

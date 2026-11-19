@@ -61,10 +61,21 @@ type PowerController interface {
 
 // BootController manages boot overrides and boot order for a system.
 type BootController interface {
-	// SetBootOverride sets the boot device to network boot for the next system
-	// power-on, bypassing the persistent boot order. The override applies to a
-	// single boot only.
+	// SetBootOverride sets a one-time PXE boot override for the next system
+	// power-on, bypassing the persistent boot order. The override is consumed
+	// after a single boot and clears automatically.
 	SetBootOverride(ctx context.Context, systemURI string) error
+
+	// SetBootOverrideContinuous sets a persistent PXE boot override that applies
+	// on every boot until DisableBootOverride is called. Used during Secure Boot
+	// configuration so intermediate BMC-initiated reboots always return to PXE
+	// rather than falling through to an installed OS.
+	SetBootOverrideContinuous(ctx context.Context, systemURI string) error
+
+	// DisableBootOverride clears any active boot source override, restoring the
+	// normal BIOS boot order. Must be called once the operation that required the
+	// continuous override is complete.
+	DisableBootOverride(ctx context.Context, systemURI string) error
 
 	// GetBootOrder retrieves the boot order for the system.
 	GetBootOrder(ctx context.Context, systemURI string) ([]string, error)
@@ -174,6 +185,88 @@ type AccountManager interface {
 	GetAccountService() (*schemas.AccountService, error)
 }
 
+// SecureBootMode mirrors the Redfish SecureBootModeType values.
+type SecureBootMode string
+
+const (
+	SecureBootModeSetup    SecureBootMode = "SetupMode"
+	SecureBootModeUser     SecureBootMode = "UserMode"
+	SecureBootModeAudit    SecureBootMode = "AuditMode"
+	SecureBootModeDeployed SecureBootMode = "DeployedMode"
+)
+
+// SecureBootResetType mirrors the Redfish SecureBoot.ResetKeys action values.
+type SecureBootResetType string
+
+const (
+	SecureBootResetDeletePK              SecureBootResetType = "DeletePK"
+	SecureBootResetDeleteAllKeys         SecureBootResetType = "DeleteAllKeys"
+	SecureBootResetResetAllKeysToDefault SecureBootResetType = "ResetAllKeysToDefault"
+)
+
+// SecureBootPolicy is a vendor-specific Secure Boot key policy. Dell exposes it
+// as the BIOS attribute "SecureBootPolicy" with values Standard/Custom; a factory
+// server ships in Standard, where the custom key databases are read-only.
+type SecureBootPolicy string
+
+const (
+	SecureBootPolicyStandard SecureBootPolicy = "Standard"
+	SecureBootPolicyCustom   SecureBootPolicy = "Custom"
+)
+
+// SecureBootState holds the current Secure Boot configuration as reported by
+// the BMC via the Redfish SecureBoot resource.
+type SecureBootState struct {
+	// Enabled is the persisted SecureBootEnable flag.
+	Enabled bool
+	// EnabledOnBoot reflects SecureBootCurrentBoot — was SB enforcing on the last boot?
+	EnabledOnBoot bool
+	// Mode is the current SecureBootMode.
+	Mode SecureBootMode
+	// Policy is the vendor Secure Boot key policy, if the vendor exposes one.
+	// Empty when the vendor has no such attribute.
+	Policy SecureBootPolicy
+}
+
+// SecureBootInspector is a read-only interface used by the metal-operator server
+// reconciler to populate Server.Status.SecureBoot, and by the MMO
+// SecureBootConfig controller for direct BMC reads during enrollment phases.
+type SecureBootInspector interface {
+	// GetSecureBootState returns the current Secure Boot state for the system.
+	GetSecureBootState(ctx context.Context, systemURI string) (*SecureBootState, error)
+}
+
+// SecureBootManager extends SecureBootInspector with write operations needed
+// by the MMO SecureBootConfig controller to enroll keys and control SB state.
+type SecureBootManager interface {
+	SecureBootInspector
+
+	// EnrollCertificate POSTs a PEM certificate to the named Secure Boot
+	// database (pk, kek, db, dbx) via the Redfish SecureBootDatabases
+	// Certificates endpoint.
+	EnrollCertificate(ctx context.Context, systemURI string, database string, pemCert string) error
+
+	// EnrollHash POSTs a SHA-256 hash to the named Secure Boot database
+	// via the Redfish SecureBootDatabases Signatures endpoint.
+	// hash must be a 64-character lowercase hex string.
+	EnrollHash(ctx context.Context, systemURI string, database string, hash string) error
+
+	// ResetSecureBootKeys executes the Redfish SecureBoot.ResetKeys action.
+	// Use DeletePK to enter Setup Mode, DeleteAllKeys to wipe all databases.
+	ResetSecureBootKeys(ctx context.Context, systemURI string, resetType SecureBootResetType) error
+
+	// EnsureCustomKeyPolicy makes sure the platform permits enrollment of custom
+	// Secure Boot keys. On Dell this stages the BIOS attribute SecureBootPolicy=Custom
+	// (a factory server ships in Standard, where the custom databases are read-only);
+	// the change is applied on the next reboot. Vendors with no such policy — or that
+	// always allow custom enrollment — return nil without acting.
+	EnsureCustomKeyPolicy(ctx context.Context, systemURI string) error
+
+	// SetSecureBootEnabled sets the SecureBootEnable flag on the BMC.
+	// Changes take effect after the next host reboot.
+	SetSecureBootEnabled(ctx context.Context, systemURI string, enable bool) error
+}
+
 // IndicatorController controls the physical indicator (locator) LED on a system.
 type IndicatorController interface {
 	// SetIndicatorLED sets the indicator LED state on the system.
@@ -204,6 +297,7 @@ type BMC interface {
 	AccountManager
 	IndicatorController
 	EventSubscriber
+	SecureBootManager
 
 	// Logout closes the BMC client connection by logging out.
 	Logout()

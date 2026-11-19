@@ -185,6 +185,10 @@ func (r *ServerReconciler) reconcile(ctx context.Context, server *metalv1alpha1.
 		return ctrl.Result{}, fmt.Errorf("failed to update server status: %w", err)
 	}
 
+	if err := r.updateSecureBootStatus(ctx, bmcClient, server); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to update server secure boot status: %w", err)
+	}
+
 	if err := r.applyBootOrder(ctx, bmcClient, server); err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to apply server BIOS boot order: %w", err)
 	}
@@ -643,6 +647,24 @@ func (r *ServerReconciler) resolvePreParkState(server *metalv1alpha1.Server) met
 }
 
 // updates the Server status which can be changed via Spec
+func (r *ServerReconciler) updateSecureBootStatus(ctx context.Context, bmcClient bmc.BMC, server *metalv1alpha1.Server) error {
+	sbState, err := bmcClient.GetSecureBootState(ctx, server.Spec.SystemURI)
+	if err != nil {
+		// Not all vendors expose the Redfish SecureBoot resource; treat as non-fatal.
+		return nil
+	}
+	want := &metalv1alpha1.SecureBootStatus{Enabled: sbState.Enabled}
+	if server.Status.SecureBoot != nil && *server.Status.SecureBoot == *want {
+		return nil
+	}
+	serverBase := server.DeepCopy()
+	server.Status.SecureBoot = want
+	if err := r.Status().Patch(ctx, server, client.MergeFrom(serverBase)); err != nil {
+		return fmt.Errorf("failed to patch Server SecureBoot status: %w", err)
+	}
+	return nil
+}
+
 func (r *ServerReconciler) updateServerStatus(ctx context.Context, bmcClient bmc.BMC, server *metalv1alpha1.Server) error {
 	log := ctrl.LoggerFrom(ctx)
 	if server.Spec.BMCRef == nil && server.Spec.BMC == nil {

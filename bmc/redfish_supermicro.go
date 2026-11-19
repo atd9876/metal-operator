@@ -16,11 +16,11 @@ type SupermicroRedfishBMC struct {
 	*RedfishBaseBMC
 }
 
-// SetBootOverride sets the boot device to network boot for the next system boot
-// on Supermicro hardware. Newer Supermicro BMCs require BootSourceOverrideMode=UEFI
-// to be sent explicitly for the override to take effect; older boards (e.g.
-// X10-series with Redfish ComputerSystem v1_3_0) don't expose the property at
-// all and reject the whole PATCH when it's included.
+// SetBootOverride sets a one-time PXE boot override on Supermicro hardware.
+// Newer Supermicro BMCs require BootSourceOverrideMode=UEFI to be sent
+// explicitly; older boards (e.g. X10-series with Redfish ComputerSystem
+// v1_3_0) don't expose the property at all and reject the whole PATCH when
+// it's included.
 func (r *SupermicroRedfishBMC) SetBootOverride(ctx context.Context, systemURI string) error {
 	system, err := r.getSystemFromUri(ctx, systemURI)
 	if err != nil {
@@ -38,7 +38,33 @@ func (r *SupermicroRedfishBMC) SetBootOverride(ctx context.Context, systemURI st
 	log := ctrl.LoggerFrom(ctx)
 	log.V(2).Info("Setting PXE boot once (Supermicro)", "SystemURI", systemURI, "Boot settings", setBoot)
 	if err := system.SetBoot(setBoot); err != nil {
-		return fmt.Errorf("failed to set the boot order: %w", err)
+		return fmt.Errorf("failed to set boot override: %w", err)
+	}
+	return nil
+}
+
+// SetBootOverrideContinuous sets a persistent PXE boot override on Supermicro
+// hardware. Newer Supermicro BMCs require BootSourceOverrideMode=UEFI to be
+// sent explicitly; older boards don't expose the property and reject it if
+// included.
+func (r *SupermicroRedfishBMC) SetBootOverrideContinuous(ctx context.Context, systemURI string) error {
+	system, err := r.getSystemFromUri(ctx, systemURI)
+	if err != nil {
+		return fmt.Errorf("failed to get systems: %w", err)
+	}
+
+	setBoot := &schemas.Boot{
+		BootSourceOverrideEnabled: schemas.ContinuousBootSourceOverrideEnabled,
+		BootSourceOverrideTarget:  schemas.PxeBootSource,
+	}
+	if system.Boot.BootSourceOverrideMode != "" {
+		setBoot.BootSourceOverrideMode = schemas.UEFIBootSourceOverrideMode
+	}
+
+	log := ctrl.LoggerFrom(ctx)
+	log.V(2).Info("Setting PXE boot continuous (Supermicro)", "SystemURI", systemURI, "Boot settings", setBoot)
+	if err := system.SetBoot(setBoot); err != nil {
+		return fmt.Errorf("failed to set continuous boot override: %w", err)
 	}
 	return nil
 }
